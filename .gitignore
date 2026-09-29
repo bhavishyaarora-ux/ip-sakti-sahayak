@@ -1,7 +1,6 @@
 # Python & Backend
 backend/.venv/
 backend/.env
-backend/qdrant_storage/
 **/__pycache__/
 *.pyc
 
