@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 # Resolve root path
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -18,7 +19,7 @@ class StatutoryRetriever:
     def __init__(self):
         print("Initializing Qdrant client & embedding model...")
         self.client = QdrantClient(path=str(STORAGE_PATH))
-        self.model = SentenceTransformer(MODEL_NAME)
+        self.model = TextEmbedding(model_name=MODEL_NAME)
 
     def retrieve(
         self,
@@ -33,7 +34,7 @@ class StatutoryRetriever:
         Performs dense vector retrieval filtered by jurisdiction and regulatory regime.
         """
         # Generate query vector
-        query_vector = self.model.encode(query, normalize_embeddings=True).tolist()
+        query_vector = list(self.model.embed([query]))[0].tolist()
 
         # Construct metadata filters
         must_conditions = []
