@@ -2,7 +2,7 @@ import sys
 import uuid
 import json
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
@@ -44,6 +44,13 @@ class CitationItem(BaseModel):
     snippet: str
 
 
+class PipelineData(BaseModel):
+    target_agents: List[str] = Field(default_factory=list)
+    reasoning_trace: List[str] = Field(default_factory=list)
+    classification: Optional[Dict[str, Any]] = None
+    routing: Optional[Dict[str, Any]] = None
+
+
 class AnalysisResponse(BaseModel):
     status: str
     needs_clarification: bool
@@ -56,6 +63,7 @@ class AnalysisResponse(BaseModel):
     retrieved_chunks: List[Dict[str, Any]]
     clarifying_questions: List[Dict[str, Any]]
     escalate_to_human: bool
+    pipeline: Optional[PipelineData] = None
 
 
 class EscalationRequest(BaseModel):
@@ -96,25 +104,27 @@ def health_check():
     return {
         "status": "healthy",
         "service": "IP-SAKTI Sahayak Engine",
-        "version": "1.0.0",
-        "timestamp": datetime.utcnow().isoformat(),
+        "version": "1.1.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @router.post("/analyze", response_model=AnalysisResponse)
 def analyze_formulation(payload: AnalysisRequest):
     """
-    Synchronous fallback endpoint: runs the formulation through the LangGraph state machine.
-    Handles diagnostic triage, jurisdiction routing, vector retrieval, and synthesis.
+    Synchronous analysis endpoint: executes the full LangGraph state machine.
+    Handles classification, routing, retrieval, worker agent evaluation, and synthesis.
     """
     try:
         input_state: AgentState = {
             "user_query": payload.query,
-            "query": payload.query,
             "user_answers": payload.user_answers,
             "forced_jurisdiction": payload.forced_jurisdiction,
             "classification": None,
             "routing": None,
+            "target_agents": [],
+            "agent_outputs": {},
+            "reasoning_trace": [],
             "retrieved_chunks": [],
             "final_response": "",
             "citations": [],
@@ -135,6 +145,13 @@ def analyze_formulation(payload: AnalysisRequest):
             else "completed"
         )
 
+        pipeline_info = PipelineData(
+            target_agents=result.get("target_agents", []),
+            reasoning_trace=result.get("reasoning_trace", []),
+            classification=classification,
+            routing=routing,
+        )
+
         return AnalysisResponse(
             status=status_code,
             needs_clarification=result.get("needs_clarification", False),
@@ -147,6 +164,7 @@ def analyze_formulation(payload: AnalysisRequest):
             retrieved_chunks=result.get("retrieved_chunks", []),
             clarifying_questions=result.get("clarifying_questions", []),
             escalate_to_human=result.get("escalate_to_human", False),
+            pipeline=pipeline_info,
         )
 
     except Exception as e:
@@ -155,11 +173,17 @@ def analyze_formulation(payload: AnalysisRequest):
         )
 
 
+@router.post("/query", response_model=AnalysisResponse)
+def query_formulation(payload: AnalysisRequest):
+    """Alias for /analyze ensuring compatibility with all frontend clients."""
+    return analyze_formulation(payload)
+
+
 @router.post("/analyze/stream")
 async def analyze_formulation_stream(payload: AnalysisRequest):
     """
-    Streams authentic LangGraph agent node execution in real time via Server-Sent Events (SSE).
-    Maps graph.py nodes: classifier -> router -> retriever -> synthesizer.
+    Streams multi-agent LangGraph execution in real time via Server-Sent Events (SSE).
+    Emits events as worker nodes run: classifier -> router -> retriever -> [worker agents] -> synthesizer.
     """
 
     async def event_generator():
@@ -169,6 +193,9 @@ async def analyze_formulation_stream(payload: AnalysisRequest):
             "forced_jurisdiction": payload.forced_jurisdiction,
             "classification": None,
             "routing": None,
+            "target_agents": [],
+            "agent_outputs": {},
+            "reasoning_trace": [],
             "retrieved_chunks": [],
             "final_response": "",
             "citations": [],
@@ -178,11 +205,14 @@ async def analyze_formulation_stream(payload: AnalysisRequest):
             "clarifying_questions": [],
         }
 
-        # Exact string mappings from builder.add_node(...) in graph.py
+        # Node mapping aligning LangGraph node names to UI identifiers
         node_ui_map = {
             "classifier": "classify",
             "router": "route",
-            "retriever": "dispatch",
+            "retriever": "retrieve",
+            "ip_agent": "ip_agent",
+            "abs_agent": "abs_agent",
+            "export_agent": "export_agent",
             "synthesizer": "synthesis",
             "clarification_stop": "clarify",
         }
@@ -193,7 +223,7 @@ async def analyze_formulation_stream(payload: AnalysisRequest):
 
             accumulated_state: Dict[str, Any] = dict(input_state)
 
-            # Stream each node directly as LangGraph executes it
+            # Stream each node as it executes in LangGraph
             async for output in orchestration_graph.astream(input_state):
                 if not isinstance(output, dict):
                     continue
@@ -212,21 +242,36 @@ async def analyze_formulation_stream(payload: AnalysisRequest):
                             "questions": accumulated_state.get(
                                 "clarifying_questions", []
                             ),
+                            "pipeline": {
+                                "target_agents": accumulated_state.get(
+                                    "target_agents", []
+                                ),
+                                "reasoning_trace": accumulated_state.get(
+                                    "reasoning_trace", []
+                                ),
+                                "classification": accumulated_state.get(
+                                    "classification", {}
+                                ),
+                                "routing": accumulated_state.get("routing", {}),
+                            },
                         }
                         yield f"data: {json.dumps(clarification_payload)}\n\n"
                         return
 
-                    # Emit real node completion event
+                    # Emit step completion event with current trace
                     step_payload = {
                         "event": "node_complete",
                         "node": ui_step,
                         "raw_node": node_name,
+                        "reasoning_trace": accumulated_state.get("reasoning_trace", []),
+                        "target_agents": accumulated_state.get("target_agents", []),
                     }
                     yield f"data: {json.dumps(step_payload)}\n\n"
-                    # Pacing: 350ms per agent lets evaluators see the handoff
-                    await asyncio.sleep(0.40)
 
-            # Final payload generation with retrieved Qdrant chunks
+                    # 300ms pacing allows evaluators to visually follow multi-agent handoffs
+                    await asyncio.sleep(0.30)
+
+            # Final payload with full statutory conclusions and pipeline metadata
             classification = accumulated_state.get("classification") or {}
             routing = accumulated_state.get("routing") or {}
 
@@ -235,14 +280,25 @@ async def analyze_formulation_stream(payload: AnalysisRequest):
                 "result": {
                     "final_response": accumulated_state.get("final_response", ""),
                     "category": classification.get("category", "Unspecified"),
-                    "confidence_score": accumulated_state.get("confidence_score", 0.92),
-                    "jurisdiction_track": routing.get("selected_track", "Unspecified"),
-                    "active_jurisdictions": routing.get("active_jurisdictions", []),
+                    "confidence_score": accumulated_state.get("confidence_score", 0.90),
+                    "jurisdiction_track": routing.get(
+                        "selected_track", "India Domestic"
+                    ),
+                    "active_jurisdictions": routing.get("active_jurisdictions", ["IN"]),
                     "citations": accumulated_state.get("citations", []),
                     "retrieved_chunks": accumulated_state.get("retrieved_chunks", []),
+                    "clarifying_questions": accumulated_state.get(
+                        "clarifying_questions", []
+                    ),
                     "escalate_to_human": accumulated_state.get(
                         "escalate_to_human", False
                     ),
+                    "pipeline": {
+                        "target_agents": accumulated_state.get("target_agents", []),
+                        "reasoning_trace": accumulated_state.get("reasoning_trace", []),
+                        "classification": classification,
+                        "routing": routing,
+                    },
                 },
             }
             yield f"data: {json.dumps(final_payload)}\n\n"
@@ -265,17 +321,22 @@ async def analyze_formulation_stream(payload: AnalysisRequest):
 @router.post("/escalate", response_model=EscalationResponse)
 def escalate_to_facilitator(payload: EscalationRequest):
     """
-    Generates an official pre-briefing case docket for empaneled AYUSH Patent Facilitators.
+    Generates a formal pre-briefing docket for empaneled AYUSH Patent Facilitators.
     """
     docket_id = f"AYUSH-IP-{uuid.uuid4().hex[:8].upper()}"
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    nba_requirement = (
-        "Form III (Mandatory prior approval before grant of IPR in India)"
-        if "Phytopharmaceutical" in payload.product_category
-        or "Proprietary" in payload.product_category
-        else "Section 40 / NTC Exemption applies if classical codified usage"
-    )
+    category = payload.product_category
+    if "Phytopharmaceutical" in category or "Proprietary" in category:
+        nba_requirement = (
+            "Section 6 BDA 2023 - Form III mandatory prior approval before patent grant; "
+            "Section 7 prior intimation to SBB for commercial manufacturing."
+        )
+    else:
+        nba_requirement = (
+            "Section 40 / Registered Practitioner exemption applies for classical Ayurvedic formulations; "
+            "SBB commercial intimation required if operating at industrial scale."
+        )
 
     dossier = f"""================================================================================
 PRE-BRIEFING AYUSH IPR DOSSIER | DOCKET: {docket_id}
@@ -294,18 +355,19 @@ Generated by IP-SAKTI Sahayak (National AYUSH Regulatory Engine)
    - Inquiry Description: "{payload.user_query}"
 
 3. STATUTORY ASSESSMENT & APPLICABLE BARRIERS
-   - Indian Patents Act : Section 3(p) / Section 3(e) prior art review mandatory.
-   - NBA Requirements   : {nba_requirement}
+   - Indian Patents Act : Section 3(p) TKDL check; Section 3(e) synergistic assay data required.
+   - NBA / SBB Duties   : {nba_requirement}
    - Relevant Citations : {", ".join(payload.citations) if payload.citations else "General Statutory Framework"}
 
 4. RECOMMENDED FACILITATOR ACTIONS
-   [ ] Perform prior-art search across TKDL and InPASS databases.
-   [ ] If Phytopharmaceutical: verify HPLC fingerprinting & clinical batch stability.
-   [ ] If P&P ASU: review synergistic efficacy data against single-herb controls.
-   [ ] Prepare draft Form 1, Form 18A (Expedited Examination for Startups), and NBA Form III.
+   [ ] Cross-verify botanical taxa against First Schedule authoritative texts & TKDL.
+   [ ] For Phytopharmaceuticals: review HPLC/HPTLC 4-marker validation and CDSCO trial protocol.
+   [ ] For Process Claims: ensure claims meet inventive threshold under Section 2(1)(j) & Section 48(b).
+   [ ] Prepare draft Form 1, Form 2 (Complete Spec), Form 18A (Expedited Startup Examination), and NBA Form III.
+   [ ] Advise on Patent Rules 2024 compliance (Form 27 triennial statement of working).
 
 ================================================================================
-LEGAL PRIVILEGE: Prepared under statutory guidance guidelines. Not formal legal counsel.
+LEGAL PRIVILEGE: Prepared under diagnostic guidance protocol. Not formal legal counsel.
 ================================================================================
 """
 
@@ -327,8 +389,8 @@ def get_supported_languages():
 @router.post("/translate", response_model=TranslationResponse)
 def translate_content(payload: TranslationRequest):
     """
-    Translates legal and regulatory findings using Bhashini with
-    Ayurvedic Entity Shielding to preserve Sanskrit terms and statutory sections.
+    Translates legal findings via Bhashini while preserving Sanskrit botanical names
+    and statutory section citations using Ayurvedic entity shielding.
     """
     if payload.target_language not in SUPPORTED_LANGUAGES:
         raise HTTPException(

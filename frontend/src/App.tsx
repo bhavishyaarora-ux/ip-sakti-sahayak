@@ -50,6 +50,7 @@ export default function App() {
   const [clarifyingQuestions, setClarifyingQuestions] = useState<any[]>([]);
   const [activeNode, setActiveNode] = useState<string | null>(null);
   const [completedNodes, setCompletedNodes] = useState<string[]>([]);
+  const [pipelineData, setPipelineData] = useState<any>(null);
 
   const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 
@@ -115,6 +116,8 @@ export default function App() {
     }
 
     try {
+      setPipelineData(null);
+
       const response = await fetch(`${API_BASE_URL}/api/analyze/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -151,40 +154,92 @@ export default function App() {
             const payload = JSON.parse(rawData);
 
             if (payload.event === 'clarification') {
-              // Questions needed: cleanly open modal without ever showing the Agent Trace
               setClarifyingQuestions(payload.questions || []);
               setDiagnosticOpen(true);
               setAnalysisResult(null);
+
+              if (payload.pipeline) {
+                setPipelineData(payload.pipeline);
+              }
+
               setLoading(false);
               setActiveNode(null);
               return;
+
             } else if (payload.event === 'node_complete') {
               console.log("REAL BACKEND NODE NAME:", payload.raw_node, "mapped to:", payload.node);
+
+              // 1. Mark node as finished
               setCompletedNodes((prev) => [...new Set([...prev, payload.node])]);
 
-              // Advance to next agent in the pipeline
-              if (payload.node === 'classify') setActiveNode('route');
-              else if (payload.node === 'route') setActiveNode('dispatch');
-              else if (payload.node === 'dispatch') setActiveNode('synthesis');
+              // 2. Update pipeline metadata independently
+              if (payload.target_agents) {
+                setPipelineData((prev: any) => ({
+                  ...prev,
+                  target_agents: payload.target_agents,
+                  reasoning_trace: payload.reasoning_trace || prev?.reasoning_trace || [],
+                }));
+              }
+
+              // 3. Clean sequential node transition
+              if (payload.node === 'classify') {
+                setActiveNode('route');
+              } else if (payload.node === 'route') {
+                setActiveNode('retrieve');
+              } else if (payload.node === 'retrieve' || payload.node === 'dispatch') {
+                const targets = payload.target_agents || [];
+                if (targets.includes('ip_agent')) {
+                  setActiveNode('ip_agent');
+                } else if (targets.includes('abs_agent')) {
+                  setActiveNode('abs_agent');
+                } else if (targets.includes('export_agent')) {
+                  setActiveNode('export_agent');
+                } else {
+                  setActiveNode('synthesis');
+                }
+              } else if (payload.node === 'ip_agent') {
+                const targets = payload.target_agents || [];
+                if (targets.includes('abs_agent')) {
+                  setActiveNode('abs_agent');
+                } else if (targets.includes('export_agent')) {
+                  setActiveNode('export_agent');
+                } else {
+                  setActiveNode('synthesis');
+                }
+              } else if (payload.node === 'abs_agent') {
+                const targets = payload.target_agents || [];
+                if (targets.includes('export_agent')) {
+                  setActiveNode('export_agent');
+                } else {
+                  setActiveNode('synthesis');
+                }
+              } else if (payload.node === 'export_agent') {
+                setActiveNode('synthesis');
+              }
+
             } else if (payload.event === 'complete') {
+              if (payload.result?.pipeline) {
+                setPipelineData(payload.result.pipeline);
+              }
               setAnalysisResult(payload.result);
               setClarifyingQuestions([]);
               setActiveNode(null);
+
             } else if (payload.event === 'error') {
               throw new Error(payload.message || 'Stream processing failure');
             }
           } catch (jsonErr) {
             console.warn('Incomplete SSE packet:', jsonErr);
           }
-        }
-      }
-    } catch (err: any) {
+        } // closes: for (const line of lines)
+      } // closes: while (true)
+    } catch (err: any) { // closes: try (line 118)
       alert(`Backend Analysis Error: ${err.message}`);
     } finally {
       setLoading(false);
       setActiveNode(null);
     }
-  };
+  }
 
   const handleLanguageChange = async (newLang: string) => {
     setSelectedLang(newLang);
@@ -524,6 +579,7 @@ export default function App() {
         activeNode={activeNode}
         completedNodes={completedNodes}
         jurisdiction={jurisdiction} 
+        pipeline={pipelineData}
       />
     )}
   </div>
