@@ -3,7 +3,6 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
-from sentence_transformers import SentenceTransformer
 from fastembed import TextEmbedding
 
 # Resolve root path
@@ -17,7 +16,7 @@ MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
 class StatutoryRetriever:
     def __init__(self):
-        print("Initializing Qdrant client & embedding model...")
+        print("Initializing Qdrant client & FastEmbed ONNX engine...")
         self.client = QdrantClient(path=str(STORAGE_PATH))
         self.model = TextEmbedding(model_name=MODEL_NAME)
 
@@ -33,7 +32,7 @@ class StatutoryRetriever:
         """
         Performs dense vector retrieval filtered by jurisdiction and regulatory regime.
         """
-        # Generate query vector
+        # Generate query vector via FastEmbed ONNX
         query_vector = list(self.model.embed([query]))[0].tolist()
 
         # Construct metadata filters
