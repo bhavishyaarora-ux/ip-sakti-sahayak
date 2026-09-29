@@ -1,0 +1,10 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+langgraph>=0.0.20
+pydantic>=2.0.0
+qdrant-client>=1.7.0
+sentence-transformers>=2.2.0
+torch
+python-multipart
+requests
+httpx
